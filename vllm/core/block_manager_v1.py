@@ -282,30 +282,50 @@ class BlockSpaceManagerV1(BlockSpaceManager):
         return 0 if seq is None else seq.n_blocks
 
     def can_allocate(self, seq_group: SequenceGroup) -> AllocStatus:
+        """
+        确实是否可以给这个seq_group分配物理块，返回结果有三种情况：
+        - AllocStatus.NEVER：不分配；
+        - AllocStatus.OK：可以分配；
+        - AllocStatus.LATER：延迟分配
+        """
         # FIXME(woosuk): Here we assume that all sequences in the group share
         # the same prompt. This may not be true for preempted sequences.
-
-        check_no_caching_or_swa_for_blockmgr_encdec(self, seq_group)
-
-        self_num_required_blocks = self._get_seq_num_required_blocks(
-            seq_group.get_seqs(status=SequenceStatus.WAITING)[0])
-        cross_num_required_blocks = self._get_seq_num_required_blocks(
-            seq_group.get_encoder_seq())
-        num_required_blocks = self_num_required_blocks + \
-                              cross_num_required_blocks
-
+        # (这里我们假设一个seq_group下的所有序列的prompt都是相同的)
+        
+        # ===========================================================================
+        # 取出这个seq_group下处于waiting状态的序列
+        # ===========================================================================
+        seq = seq_group.get_seqs(status=SequenceStatus.WAITING)[0]
+        
+        # ===========================================================================
+        # 取出这个seq所有的逻辑块
+        # ===========================================================================
+        num_required_blocks = len(seq.logical_token_blocks)
+    
+        # ===========================================================================
+        # block上的滑动窗口（可暂时假设其值为None，先忽略不看
+        # ===========================================================================
         if self.block_sliding_window is not None:
-
             num_required_blocks = min(num_required_blocks,
                                       self.block_sliding_window)
+        # ===========================================================================
+        # 计算当前所有可用的物理块数量，List[PhysicalTokenBlock]
+        # ===========================================================================
         num_free_gpu_blocks = self.gpu_allocator.get_num_free_blocks()
-
+    
+        # ===========================================================================
         # Use watermark to avoid frequent cache eviction.
+        # 决定是否能为当前seq分配物理块
+        # ===========================================================================
+        # 如果设备中所有的物理块数量 - 该seq实际需要的物理块数量 < 水位线block数量，则不分配
+        # （说明当前seq太长了）
         if (self.num_total_gpu_blocks - num_required_blocks <
                 self.watermark_blocks):
             return AllocStatus.NEVER
+        # 如果设备中可用的物理块数量 - 该seq实际需要的block数量 >= 水位线block数量，则分配
         if num_free_gpu_blocks - num_required_blocks >= self.watermark_blocks:
             return AllocStatus.OK
+        # 否则，现在不能分配，但可以延迟分配
         else:
             return AllocStatus.LATER
 
