@@ -1498,17 +1498,49 @@ class Scheduler:
             seq.status = SequenceStatus.SWAPPED
 
     def _passed_delay(self, now: float) -> bool:
+        """
+        判断当下是否可以从waiting队列中调度新请求
+        这个函数确保了在调度过程中不会频繁地处理新来的seq_group
+        
+        Args:
+            now: 当前调度时间点
+        """
+        # =============================================================================
+        # self.prev_prompt: True/False，记录上一次调度步骤中，是否选择了从waiting队列中做调度
+        # self.prev_time：上次调度步骤时间点（不管是从哪个队列中调度，每次调度都会记录下时间点）
+        # 若上个调度步骤中，我们选择从waiting队列中做调度，则计算两个调度时刻的间隔
+        # ==============================================================================
         if self.prev_prompt:
             self.last_prompt_latency = now - self.prev_time
+        
+        # =============================================================================
+        # 用当前调度时间更新prev_time
+        # 由于目前还不知道本次是否会从waiting队列中调度，因此prev_prompt先设为False
+        # =============================================================================
         self.prev_time, self.prev_prompt = now, False
+        
+        # =============================================================================
         # Delay scheduling prompts to let waiting queue fill up
+        # delay_factor：用户配置的，用于调整调度间隔阈值的因子。大于0则意味着用户想开启阈值判断
+        # =============================================================================
         if self.scheduler_config.delay_factor > 0 and self.waiting:
+            # =========================================================================
+            # 计算在waiting队列中，最早到达的seq_group的到达时间
+            # =========================================================================
             earliest_arrival_time = min(
                 [e.metrics.arrival_time for e in self.waiting])
+            # =========================================================================
+            # now - earliest_arrival_time：最早到达waiting队列的seq_group当前“实际”等待的时间
+            # delay_factor*last_prompt_latency：最早到达waiting队列的请求当前“应该”等待的时间
+            # 只要前者比后者大，或者此时running队列中根本没有请求在跑，就可以进行对waiting做调度
+            # =========================================================================
             passed_delay = (
                 (now - earliest_arrival_time) >
                 (self.scheduler_config.delay_factor * self.last_prompt_latency)
                 or not self.running)
+        # =============================================================================
+        # 如果你不想开启阈值判断，那就直接返回True
+        # =============================================================================
         else:
             passed_delay = True
         return passed_delay
