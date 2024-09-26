@@ -283,7 +283,7 @@ class BlockSpaceManagerV1(BlockSpaceManager):
 
     def can_allocate(self, seq_group: SequenceGroup) -> AllocStatus:
         """
-        确实是否可以给这个seq_group分配物理块，返回结果有三种情况：
+        确认是否可以给这个seq_group分配物理块，返回结果有三种情况：
         - AllocStatus.NEVER：不分配；
         - AllocStatus.OK：可以分配；
         - AllocStatus.LATER：延迟分配
