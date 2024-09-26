@@ -1409,10 +1409,13 @@ class Scheduler:
 
     def _preempt(
         self,
-        seq_group: SequenceGroup,
-        blocks_to_swap_out: List[Tuple[int, int]],
+        seq_group: SequenceGroup, # 被抢占的seq_group
+        blocks_to_swap_out: Dict[int, int],
         preemption_mode: Optional[PreemptionMode] = None,
-    ) -> PreemptionMode:
+    ) -> None:
+        """
+        对被抢占的seq_group进行处理，包括修改其下seq状态，做好gpu到cpu块之间的映射等
+        """
         # If preemption mode is not specified, we determine the mode as follows:
         # We use recomputation by default since it incurs lower overhead than
         # swapping. However, when the sequence group has multiple sequences
@@ -1424,76 +1427,96 @@ class Scheduler:
         # over sequence groups with a single sequence.
         # TODO(woosuk): Support recomputation for sequence groups with multiple
         # sequences. This may require a more sophisticated CUDA kernel.
-        if self.user_specified_preemption_mode is None:
+        
+        # 如果没有指定被抢占的类型
+        if preemption_mode is None:
+            # 如果这个seq_group在剩余生命周期中并行运行的最大seq数为1
             if seq_group.get_max_num_running_seqs() == 1:
+                # 就将抢占类型定位“recompute”
                 preemption_mode = PreemptionMode.RECOMPUTE
+            # 否则定为swap
             else:
                 preemption_mode = PreemptionMode.SWAP
-
-        elif self.user_specified_preemption_mode == "swap":
-            preemption_mode = PreemptionMode.SWAP
-        else:
-            preemption_mode = PreemptionMode.RECOMPUTE
-
-        if self.num_cumulative_preemption % 50 == 0:
-            logger.warning(
-                "Sequence group %s is preempted by %s mode because there is "
-                "not enough KV cache space. This can affect the end-to-end "
-                "performance. Increase gpu_memory_utilization or "
-                "tensor_parallel_size to provide more KV cache memory. "
-                "total_num_cumulative_preemption=%d", seq_group.request_id,
-                preemption_mode, self.num_cumulative_preemption + 1)
-        self.num_cumulative_preemption += 1
-
+        
+        # =======================================================================
+        # 如果抢占类型是“RECOMPUTE”
+        # 则去除该seq对对应物理块的引用，同时将该seq状态改为running，放入waiting队列最前面
+        # （详情参见self._preempt_by_recompute）
+        # =======================================================================
         if preemption_mode == PreemptionMode.RECOMPUTE:
             self._preempt_by_recompute(seq_group)
+        # =======================================================================
+        # 如果抢占类型是“SWAP“
+        # 详情参见self._preempt_by_swap）
+        # =======================================================================
         elif preemption_mode == PreemptionMode.SWAP:
             self._preempt_by_swap(seq_group, blocks_to_swap_out)
         else:
             raise AssertionError("Invalid preemption mode.")
-        return preemption_mode
 
     def _preempt_by_recompute(
         self,
         seq_group: SequenceGroup,
     ) -> None:
+        # 获取这个seq_group下正在running的所有seqs，
+        # preemption_mode是RECOMPUTE时需要满足正在running的seqs数量为1
         seqs = seq_group.get_seqs(status=SequenceStatus.RUNNING)
         assert len(seqs) == 1
+        
         for seq in seqs:
+            # 将这条seq的状态从running改成waiting（后续这条seq就要重计算了）
             seq.status = SequenceStatus.WAITING
+            # 释放这条seq对应的物理块
+            # 即将对应物理块的引用-1，如果此时引用数量为0，说明对应物理块完全自由了，需要再将其放入自由物理块列表中
             self.free_seq(seq)
+            # 因为这条seq需要重计算了，所以将其data对象下_num_computed_tokens设置为0
             seq.reset_state_for_recompute()
+        
+        # NOTE: For FCFS, we insert the preempted sequence group to the front
+        # of the waiting queue.
+        # 将被抢占，且未来需要重计算的序列，放到waiting队列的最前面
+        self.waiting.appendleft(seq_group)
 
     def _preempt_by_swap(
         self,
         seq_group: SequenceGroup,
-        blocks_to_swap_out: List[Tuple[int, int]],
+        blocks_to_swap_out: Dict[int, int],
     ) -> None:
+        # ======================================================================
+        # - 释放该seq_group下所有seq的物理块，并为其分配对应的cpu物理块，
+        # - 将seq的状态从running改成swapped
+        # ======================================================================
         self._swap_out(seq_group, blocks_to_swap_out)
-
-    def _swap_in(
+        # ======================================================================
+        # 在scheduler的swapped队列中添加该seq_group
+        # ======================================================================
+        self.swapped.append(seq_group)
+  
+      def _swap_out(
         self,
-        seq_group: SequenceGroup,
-        blocks_to_swap_in: List[Tuple[int, int]],
+        seq_group: SequenceGroup, # 需要被swap到cpu上的seq_group
+        blocks_to_swap_out: Dict[int, int],
     ) -> None:
-        mapping = self.block_manager.swap_in(seq_group)
-        blocks_to_swap_in.extend(mapping)
-        for seq in seq_group.get_seqs(status=SequenceStatus.SWAPPED):
-            seq.status = SequenceStatus.RUNNING
-
-    def _swap_out(
-        self,
-        seq_group: SequenceGroup,
-        blocks_to_swap_out: List[Tuple[int, int]],
-    ) -> None:
+        # ======================================================================
+        # 检查是否可以将当前seq_group对应的物理块swap到cpu上
+        # 可以的条件：当前seq_group占用的gpu物理块数量 <= cpu上可用的物理块数量
+        # ======================================================================
         if not self.block_manager.can_swap_out(seq_group):
             # FIXME(woosuk): Abort the sequence group instead of aborting the
             # entire engine.
             raise RuntimeError(
                 "Aborted due to the lack of CPU swap space. Please increase "
                 "the swap space to avoid this error.")
+        # ======================================================================
+        # 释放该seq_group下所有seq的gpu物理块，并为其创建对应的cpu块
+        # mapping：{gpu物理块id：cpu物理块id}
+        # ======================================================================
         mapping = self.block_manager.swap_out(seq_group)
-        blocks_to_swap_out.extend(mapping)
+        blocks_to_swap_out.update(mapping)
+        
+        # ======================================================================
+        # 修改该seq_group下所有seq的状态：从running改成swapped
+        # ======================================================================
         for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
             seq.status = SequenceStatus.SWAPPED
 
